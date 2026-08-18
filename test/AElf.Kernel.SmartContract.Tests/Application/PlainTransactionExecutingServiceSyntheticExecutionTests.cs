@@ -47,8 +47,43 @@ public sealed class PlainTransactionExecutingServiceSyntheticExecutionTests
         returnSet.StateDeletes.ShouldBeEmpty();
         returnSet.Bloom.ShouldBe(ByteString.Empty);
         executive.Verify(e => e.ApplyAsync(It.IsAny<ITransactionContext>()), Times.Never);
-        CountSyntheticExecutionLogs(logger, LogLevel.Debug).ShouldBe(1);
-        CountSyntheticExecutionLogs(logger, LogLevel.Warning).ShouldBe(0);
+        CountSyntheticExecutionLogs(logger, LogLevel.Warning).ShouldBe(1);
+        CountSyntheticExecutionLogs(logger, LogLevel.Debug).ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_BypassedContract_Should_Still_Run_Fee_Plugins()
+    {
+        // The fix skips ONLY the contract body, not the whole pipeline: the fee (pre-execution) plugins
+        // must still run for the bypassed contract so that fees are charged and the recomputed block state
+        // stays identical to a normal node's — otherwise re-synced / partially-upgraded nodes diverge.
+        var executive = CreateExecutive();
+        executive.Setup(e => e.ApplyAsync(It.IsAny<ITransactionContext>()))
+            .ThrowsAsync(new ShouldAssertException("Bypassed contract body should not call ApplyAsync."));
+
+        var prePlugin = new Mock<IPreExecutionPlugin>();
+        prePlugin.Setup(p => p.GetPreTransactionsAsync(
+                It.IsAny<IReadOnlyList<ContractServiceDescriptor>>(), It.IsAny<ITransactionContext>()))
+            .ReturnsAsync(Enumerable.Empty<Transaction>());
+
+        var service = CreateService(executive.Object, new[] { prePlugin.Object });
+        service.Logger = new Mock<ILogger<PlainTransactionExecutingService>>().Object;
+
+        var returnSets = await service.ExecuteAsync(new TransactionExecutingDto
+        {
+            BlockHeader = CreateBlockHeader(),
+            Transactions = new[]
+            {
+                CreateTransaction(BypassedContractAddress)
+            }
+        }, CancellationToken.None);
+
+        returnSets.Single().Status.ShouldBe(TransactionResultStatus.Mined);
+        // Body skipped ...
+        executive.Verify(e => e.ApplyAsync(It.IsAny<ITransactionContext>()), Times.Never);
+        // ... but the fee / pre-execution plugin stage still ran (pipeline not short-circuited).
+        prePlugin.Verify(p => p.GetPreTransactionsAsync(
+            It.IsAny<IReadOnlyList<ContractServiceDescriptor>>(), It.IsAny<ITransactionContext>()), Times.Once);
     }
 
     [Fact]
@@ -73,7 +108,8 @@ public sealed class PlainTransactionExecutingServiceSyntheticExecutionTests
         executive.Verify(e => e.ApplyAsync(It.IsAny<ITransactionContext>()), Times.Once);
     }
 
-    private static PlainTransactionExecutingService CreateService(IExecutive executive)
+    private static PlainTransactionExecutingService CreateService(IExecutive executive,
+        IEnumerable<IPreExecutionPlugin> prePlugins = null)
     {
         var executiveService = new Mock<ISmartContractExecutiveService>();
         executiveService.Setup(s => s.GetExecutiveAsync(It.IsAny<IChainContext>(), It.IsAny<Address>()))
@@ -96,7 +132,7 @@ public sealed class PlainTransactionExecutingServiceSyntheticExecutionTests
         return new PlainTransactionExecutingService(
             executiveService.Object,
             new List<IPostExecutionPlugin>(),
-            new List<IPreExecutionPlugin>(),
+            (prePlugins ?? Enumerable.Empty<IPreExecutionPlugin>()).ToList(),
             new TransactionContextFactory(thresholdProvider.Object),
             featureDisableService.Object,
             ResolveSyntheticTransactionExecutionProvider());
@@ -144,6 +180,6 @@ public sealed class PlainTransactionExecutingServiceSyntheticExecutionTests
         return logger.Invocations.Count(invocation =>
             invocation.Method.Name == nameof(ILogger.Log) &&
             (LogLevel)invocation.Arguments[0] == logLevel &&
-            invocation.Arguments[2].ToString().Contains("synthetically mined"));
+            invocation.Arguments[2].ToString().Contains("synthetically skipped"));
     }
 }

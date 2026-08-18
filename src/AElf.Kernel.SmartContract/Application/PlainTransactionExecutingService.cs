@@ -145,13 +145,6 @@ public class PlainTransactionExecutingService : IPlainTransactionExecutingServic
         var txContext = CreateTransactionContext(singleTxExecutingDto);
         var trace = txContext.Trace;
 
-         if (_syntheticTransactionExecutionProvider.TryApply(singleTxExecutingDto.Transaction, trace))
-        {
-            Logger.LogDebug("Transaction {TransactionId} to contract {ContractAddress} was synthetically mined.",
-                trace.TransactionId, singleTxExecutingDto.Transaction.To);
-            return trace;
-        }
-
         var internalStateCache = new TieredStateCache(singleTxExecutingDto.ChainContext.StateCache);
         var internalChainContext =
             new ChainContextWithTieredStateCache(singleTxExecutingDto.ChainContext, internalStateCache);
@@ -185,7 +178,20 @@ public class PlainTransactionExecutingService : IPlainTransactionExecutingServic
 
             #endregion
 
-            await executive.ApplyAsync(txContext);
+            // Synthetic execution: for the bypassed (malicious) contract, skip ONLY the contract body
+            // (executive.ApplyAsync) but keep the surrounding fee pre/post plugins. The malicious method
+            // performs no on-chain state read/write and emits no events, so its only committed footprint
+            // is the transaction fee. Charging fees exactly as a normal node does keeps the recomputed
+            // MerkleTreeRootOfWorldState / Bloom identical to the original execution (the only difference,
+            // trace.ReturnValue, is not committed to any block-header merkle root), so re-synced and
+            // partially-upgraded nodes still agree on the block hash. It also closes the free-transaction
+            // spam vector that returning before the fee plugins would open.
+            if (_syntheticTransactionExecutionProvider.TryApply(singleTxExecutingDto.Transaction, trace))
+                Logger.LogWarning(
+                    "Transaction {TransactionId} to contract {ContractAddress}: contract body synthetically skipped (fees still charged).",
+                    trace.TransactionId, singleTxExecutingDto.Transaction.To);
+            else
+                await executive.ApplyAsync(txContext);
 
             if (txContext.Trace.IsSuccessful())
                 await ExecuteInlineTransactions(singleTxExecutingDto.Depth, singleTxExecutingDto.CurrentBlockTime,
